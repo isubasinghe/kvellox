@@ -1,0 +1,8 @@
+[package]
+name = "kvellox"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+rart = { git = "https://github.com/rdaum/rart-rs.git", version = "0.1.0" }
