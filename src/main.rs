@@ -4,6 +4,7 @@ mod engine;
 mod storage;
 mod index;
 mod art;
+mod io;
 
 fn main() {
     println!("Hello, world!");
