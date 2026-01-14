@@ -1,5 +1,10 @@
 use std::alloc::{alloc, dealloc};
+use std::fs::File;
 use std::{alloc::Layout, cell::RefCell, ptr::NonNull, rc::Rc};
+use monoio::buf::IoBufMut;
+use monoio::fs::File as MonoFile;
+
+
 
 use super::cache::S3Fifo;
 
@@ -41,7 +46,7 @@ impl Drop for PageDescriptor {
 }
 
 pub struct Page {
-    data: NonNull<PageDescriptor>
+    pub data: NonNull<PageDescriptor>
 }
 
 impl Clone for Page {
@@ -51,9 +56,38 @@ impl Clone for Page {
     }
 }
 
+unsafe impl IoBufMut for Page {
+    fn write_ptr(&mut self) -> *mut u8 {
+        unsafe {
+            self.data.as_ref().buffer.as_ptr()
+        }
+        
+    }
+
+    fn bytes_total(&mut self) -> usize {
+        4096
+    }
+
+    unsafe fn set_init(&mut self, _: usize) {
+     
+    }
+
+}
 impl Page {
     pub fn new() -> Page {
         Page { data: NonNull::new(&mut PageDescriptor::new()).unwrap() }
+    }
+
+    pub async fn read_from_file(&mut self, file: &File, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let f = file.try_clone()?;
+        let mono_file = MonoFile::from_std(f)?;
+        let (result, _) = mono_file.read_exact_at(self.clone(), offset).await;
+        result?;
+
+        Ok(())
+    }
+
+    pub async fn write_to_file(&mut self, file: &File, offset: u64) {
     }
 }
 

@@ -8,7 +8,7 @@ use std::io;
 use std::path::Path;
 use std::fs::OpenOptions;
 use libc;
-use super::page::{PageCacheManager, Page, PageData};
+use super::page::{PageCacheManager, Page};
 use std::error::Error;
 
 use std::os::fd::AsRawFd;
@@ -123,7 +123,7 @@ impl < const N: i64> Slab< N> {
         let page = match maybe_page {
             Some(page) => page,
             None => {
-                self.read_page(page_number).await
+                self.read_page(page_number).await.unwrap()
             }
         };
 
@@ -133,10 +133,12 @@ impl < const N: i64> Slab< N> {
     pub async fn read_item(idx: usize) {
     }
 
-    pub async fn read_page(&mut self, page_index: i64) -> Page {
+    pub async fn read_page(&mut self, page_index: i64) -> Result<Page, Box<dyn Error>> {
         let offset = page_index*PAGE_SIZE;
         let mut page = Page::new();
-        todo!()
+        page.read_from_file(&self.file, offset as u64).await?;
+        self.page_manager.page_hit(page_index, page.clone());
+        Ok(page)
     }
 
     pub async fn write_page() {
