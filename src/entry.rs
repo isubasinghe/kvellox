@@ -7,7 +7,7 @@ const TOMBSTONE_MASK: u8 = 1 << 1;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct EntryHeader {
-    pub timestamp: usize,
+    pub timestamp: u64,
     pub key_size: i64,
     pub value_size: i64,
     pub meta: u8

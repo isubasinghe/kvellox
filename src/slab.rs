@@ -1,20 +1,22 @@
 use crate::entry::EntryHeader;
 
 use super::static_data::*;
+use std::alloc::Layout;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 use std::fs::OpenOptions;
 use libc;
-use super::page::{PageCacheManager, Page};
+use super::page::{PageCacheManager, Page, PageData};
 use std::error::Error;
 
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
 
-pub struct Slab <'a, const N: i64> {
-    page_manager: PageCacheManager<'a>,
+pub struct Slab <const N: i64> {
+    page_manager: PageCacheManager,
     size_on_disk: i64,
     free_list: Vec<usize>,
     idx: i64,
@@ -23,7 +25,7 @@ pub struct Slab <'a, const N: i64> {
     file: File,
 }
 
-impl <'a, const N: i64> Slab<'a, N> {
+impl < const N: i64> Slab< N> {
     pub async fn new(root_path: &Path) -> Slab<N> {
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
@@ -76,6 +78,7 @@ impl <'a, const N: i64> Slab<'a, N> {
     }
 
     pub async fn advance_idx(&mut self) {
+        self.idx += 1;
 
     }
 
@@ -105,8 +108,8 @@ impl <'a, const N: i64> Slab<'a, N> {
         }
         self.preallocate(0, new_size)
     }
-
-    pub async fn write_item(&mut self, key: &'a[u8], value: &'a [u8]) -> Result<(), Box<dyn Error>>{
+    
+    pub async fn write_item<'a>(&mut self, key: &'a[u8], value: &'a [u8]) -> Result<(), Box<dyn Error>>{
         if self.free_list.len() != 0 {
             panic!("no support for this at the moment");
         }
@@ -114,7 +117,15 @@ impl <'a, const N: i64> Slab<'a, N> {
             return self.resize();
         }
         let page_number = (self.idx * N) / PAGE_SIZE;
-        let mut entry_header = EntryHeader{timestamp: 0, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
+        let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut entry_header = EntryHeader{timestamp: time, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
+        let maybe_page = self.page_manager.get_page(page_number);
+        let page = match maybe_page {
+            Some(page) => page,
+            None => {
+                self.read_page(page_number).await
+            }
+        };
 
         Ok(())
     }
@@ -122,7 +133,10 @@ impl <'a, const N: i64> Slab<'a, N> {
     pub async fn read_item(idx: usize) {
     }
 
-    pub async fn read_page() {
+    pub async fn read_page(&mut self, page_index: i64) -> Page {
+        let offset = page_index*PAGE_SIZE;
+        let mut page = Page::new();
+        todo!()
     }
 
     pub async fn write_page() {
