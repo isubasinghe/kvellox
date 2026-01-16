@@ -1,6 +1,7 @@
 use crate::entry::EntryHeader;
 
 use super::static_data::*;
+use bitcode;
 use std::alloc::Layout;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs::{self, File};
@@ -71,7 +72,7 @@ impl < const N: i64> Slab< N> {
         if meta.len() != 0 {
             panic!("recovery not supported at the moment");
         }
-        let mut slab = Slab{page_manager: page_cache_manager, size_on_disk: meta.len() as i64, free_list: Vec::new(), idx: 0, file, nb_max_items: (N/(2*PAGE_SIZE)), nb_items: 0};
+        let mut slab = Slab{page_manager: page_cache_manager, size_on_disk: meta.len() as i64, free_list: Vec::new(), idx: 0, file, nb_max_items: (2*PAGE_SIZE)/N, nb_items: 0};
         slab.preallocate(0, 2 * PAGE_SIZE).unwrap();
         slab.size_on_disk = 2 * PAGE_SIZE;
         slab
@@ -84,7 +85,7 @@ impl < const N: i64> Slab< N> {
 
     pub fn preallocate(&mut self, offset: i64, size: i64) -> Result<(), Box<dyn Error>> {
         let fd = self.file.as_raw_fd(); 
-        let mode = libc::FALLOC_FL_KEEP_SIZE;
+        let mode = 0;
         let offset = offset;
         let len = size;
         let ret = unsafe {
@@ -92,7 +93,8 @@ impl < const N: i64> Slab< N> {
         };
 
         if ret == 0 {
-            self.nb_max_items = N/size;
+            self.size_on_disk = size;
+            self.nb_max_items = size / N;
             Ok(())
         }else {
             Err(Box::new(std::io::Error::last_os_error()))
@@ -114,19 +116,34 @@ impl < const N: i64> Slab< N> {
             panic!("no support for this at the moment");
         }
         if self.idx >= self.nb_max_items {
-            return self.resize();
+            self.resize()?;
         }
-        let page_number = (self.idx * N) / PAGE_SIZE;
+
+        let entry_offset = self.idx * N;
+        let page_number = entry_offset / PAGE_SIZE;
+        let page_offset = entry_offset % PAGE_SIZE;
+
         let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let mut entry_header = EntryHeader{timestamp: time, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
+        let entry_header = EntryHeader{timestamp: time, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
+
+        let mut encoded = bitcode::encode(&entry_header);
+        encoded.reserve(key.len() + value.len());
+        encoded.extend_from_slice(key);
+        encoded.extend_from_slice(value);
+        
+
         let maybe_page = self.page_manager.get_page(page_number);
-        let page = match maybe_page {
+        let mut page = match maybe_page {
             Some(page) => page,
             None => {
-                self.read_page(page_number).await.unwrap()
+                self.read_page(page_number).await?
             }
         };
-
+        
+        page.write_bytes(page_offset as u64, encoded.as_mut_ptr(), encoded.len());
+        let page_start_offset = page_number * PAGE_SIZE;
+        page.write_to_file(&self.file, page_start_offset as u64).await?;
+        self.idx += 1;
         Ok(())
     }
 

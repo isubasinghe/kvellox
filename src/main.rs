@@ -23,7 +23,8 @@ fn main() {
 
     rt.block_on(async {
         let mut slab = slab.await;
-        slab.write_item("hello".as_bytes(), "world".as_bytes()).await.unwrap() 
+        slab.write_item("hello".as_bytes(), "world".as_bytes()).await.unwrap() ;
+        slab.write_item("this".as_bytes(), "is kinda cool".as_bytes()).await.unwrap() ;
     });
     println!("Hello, world!");
 }

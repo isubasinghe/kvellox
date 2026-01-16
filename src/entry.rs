@@ -1,3 +1,4 @@
+use bitcode::{Encode, Decode};
 // Constants representing the bit masks
 // Bit 0: 0000 0001
 const DIRTY_MASK: u8 = 1 << 0; 
@@ -5,7 +6,7 @@ const DIRTY_MASK: u8 = 1 << 0;
 const TOMBSTONE_MASK: u8 = 1 << 1;
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct EntryHeader {
     pub timestamp: u64,
     pub key_size: i64,

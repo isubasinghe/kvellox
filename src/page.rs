@@ -1,7 +1,7 @@
 use std::alloc::{alloc, dealloc};
 use std::fs::File;
 use std::{alloc::Layout, cell::RefCell, ptr::NonNull, rc::Rc};
-use monoio::buf::IoBufMut;
+use monoio::buf::{IoBuf, IoBufMut};
 use monoio::fs::File as MonoFile;
 
 
@@ -56,6 +56,18 @@ impl Clone for Page {
     }
 }
 
+unsafe impl IoBuf for Page {
+    fn read_ptr(&self) -> *const u8 {
+        unsafe {
+            self.data.as_ref().buffer.as_ptr()
+        }
+    }
+
+    fn bytes_init(&self) -> usize {
+        4096
+    }
+}
+
 unsafe impl IoBufMut for Page {
     fn write_ptr(&mut self) -> *mut u8 {
         unsafe {
@@ -75,7 +87,10 @@ unsafe impl IoBufMut for Page {
 }
 impl Page {
     pub fn new() -> Page {
-        Page { data: NonNull::new(&mut PageDescriptor::new()).unwrap() }
+        let descriptor = Box::new(PageDescriptor::new());
+        Page {
+            data: NonNull::new(Box::into_raw(descriptor)).unwrap(),
+        }
     }
 
     pub async fn read_from_file(&mut self, file: &File, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -87,7 +102,22 @@ impl Page {
         Ok(())
     }
 
-    pub async fn write_to_file(&mut self, file: &File, offset: u64) {
+    pub async fn write_to_file(&mut self, file: &File, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let f = file.try_clone()?;
+        let mono_file = MonoFile::from_std(f)?;
+        let (result, _) = mono_file.write_all_at(self.clone(), offset).await;
+        result?;
+        unsafe {
+            self.data.as_mut().is_dirty = false;
+        }
+        Ok(())
+    }
+
+    pub fn write_bytes(&mut self, offset: u64, data: *mut u8, len: usize) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(data, self.data.as_mut().buffer.offset(offset as isize).as_mut(), len); 
+            self.data.as_mut().is_dirty = true;
+        }
     }
 }
 
