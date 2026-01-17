@@ -93,22 +93,18 @@ impl Page {
         }
     }
 
-    pub async fn read_from_file(&mut self, file: &File, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let f = file.try_clone()?;
-        let mono_file = MonoFile::from_std(f)?;
-        let (result, _) = mono_file.read_exact_at(self.clone(), offset).await;
+    pub async fn read_from_file(&mut self, file: &MonoFile, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let (result, _) = file.read_exact_at(self.clone(), offset).await;
         result?;
 
         Ok(())
     }
 
-    pub async fn write_to_file(&mut self, file: &File, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let f = file.try_clone()?;
-        let mono_file = MonoFile::from_std(f)?;
-        let (result, _) = mono_file.write_all_at(self.clone(), offset).await;
+    pub async fn write_to_file(&self, file: &MonoFile, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let (result, _) = file.write_all_at(self.clone(), offset).await;
         result?;
         unsafe {
-            self.data.as_mut().is_dirty = false;
+            (*self.data.as_ptr()).is_dirty = false;
         }
         Ok(())
     }

@@ -9,11 +9,15 @@ bitcode = "0.6.9"
 clap = { version = "4.5.32", features = ["derive"] }
 core_affinity = "0.8.3"
 crossbeam-queue = "0.3.12"
+etcd-client = "0.17.0"
+flume = "0.12.0"
+futures = "0.3.31"
 io-uring = "0.7.4"
 libc = "0.2.180"
 monoio = "0.2.4"
 rart = { git = "https://github.com/rdaum/rart-rs.git", version = "0.1.0" }
 scc = "3.4.9"
 serde = { version = "1.0.228", features = ["derive"] }
+sled = "0.34.7"
 tokio = { version = "1.44.1", features = ["full", "rt"] }
 tokio-uring = { version = "0.5.0", features = ["bytes"] }

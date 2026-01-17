@@ -1,16 +1,13 @@
 use crate::entry::EntryHeader;
-
 use super::static_data::*;
-use bitcode;
-use std::alloc::Layout;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fs::{self, File};
-use std::io;
 use std::path::Path;
 use std::fs::OpenOptions;
 use libc;
 use super::page::{PageCacheManager, Page};
 use std::error::Error;
+use monoio::fs::File as MonoFile;
+use monoio::buf::IoBuf;
 
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -22,9 +19,10 @@ pub struct Slab <const N: i64> {
     free_list: Vec<usize>,
     idx: i64,
     nb_max_items: i64,
-    nb_items: i64,
-    file: File,
+    file: MonoFile,
 }
+
+use futures::stream::{FuturesUnordered, StreamExt};
 
 impl < const N: i64> Slab< N> {
     pub async fn new(root_path: &Path) -> Slab<N> {
@@ -38,49 +36,104 @@ impl < const N: i64> Slab< N> {
 
         #[cfg(target_os = "windows")]
         {
-            // FILE_FLAG_NO_BUFFERING = 0x20000000
-            // FILE_FLAG_WRITE_THROUGH = 0x80000000 (often used together)
             const FILE_FLAG_NO_BUFFERING: u32 = 0x20000000;
             options.custom_flags(FILE_FLAG_NO_BUFFERING);
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            // macOS doesn't support a direct I/O flag in open().
-            // You must open normally, then disable caching via fcntl.
-            let file = options.open(path)?;
-            use std::os::unix::io::AsRawFd;
-            unsafe {
-                let fd = file.as_raw_fd();
-                // F_NOCACHE = 48
-                libc::fcntl(fd, libc::F_NOCACHE, 1);
-            }
-            return Ok(file);
-        }
-
         let file_name = root_path.join(format!("db-size-{}.dbpart", N));
 
-        let file = options.open(file_name).unwrap();
+        let std_file = options.open(file_name).unwrap();
 
-        let meta = file.metadata().unwrap();
+        let meta = std_file.metadata().unwrap();
         
-        println!("Size: {}", meta.len());
-        println!("Block size: {}", meta.blksize());
-        println!("Blocks allocated: {}", meta.blocks());
+        let page_cache_manager = PageCacheManager::new(PAGE_CACHE_SIZE as usize);
 
-        let mut page_cache_manager = PageCacheManager::new(PAGE_CACHE_SIZE as usize);
-        if meta.len() != 0 {
-            panic!("recovery not supported at the moment");
+        let mono_file = MonoFile::from_std(std_file).unwrap();
+
+        let mut slab = Slab{
+            page_manager: page_cache_manager, 
+            size_on_disk: meta.len() as i64, 
+            free_list: Vec::new(), 
+            idx: 0, 
+            file: mono_file, 
+            nb_max_items: (2*PAGE_SIZE)/N, 
+        };
+
+        slab.rebuild().await;
+
+        let target_size = std::cmp::max(slab.size_on_disk, 2 * PAGE_SIZE);
+        if target_size > slab.size_on_disk {
+             slab.preallocate(0, target_size).unwrap();
+             slab.size_on_disk = target_size;
+             slab.nb_max_items = target_size / N;
         }
-        let mut slab = Slab{page_manager: page_cache_manager, size_on_disk: meta.len() as i64, free_list: Vec::new(), idx: 0, file, nb_max_items: (2*PAGE_SIZE)/N, nb_items: 0};
-        slab.preallocate(0, 2 * PAGE_SIZE).unwrap();
-        slab.size_on_disk = 2 * PAGE_SIZE;
+        
         slab
     }
 
-    pub async fn advance_idx(&mut self) {
-        self.idx += 1;
+    pub async fn rebuild(&mut self) {
+        let number_pages = self.size_on_disk / (PAGE_SIZE);
+        let items_per_page = PAGE_SIZE / N;
+        let max_items = number_pages * items_per_page;
+        self.nb_max_items = max_items;
+        
+        let mut futures = FuturesUnordered::new();
+        
+        // Spawn reads
+        for n in 0..number_pages {
+            let offset = n * PAGE_SIZE;
+            let file_ref = &self.file; 
+            futures.push(async move {
+                let mut page = Page::new();
+                if let Err(e) = page.read_from_file(file_ref, offset as u64).await {
+                    return Err((n, e));
+                }
+                Ok((n, page))
+            });
+        }
 
+        // Process pages as they load
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok((page_idx, page)) => {
+                    self.page_manager.page_hit(page_idx, page.clone());
+                    
+                    // Iterate over items in the page
+                    let items_per_page = PAGE_SIZE / N;
+                    for i in 0..items_per_page {
+                        let item_offset = (i * N) as usize;
+                        let abs_idx = (page_idx * items_per_page) + i;
+                        
+                        // Access raw bytes of the item
+                        let page_ptr = page.read_ptr();
+                        let item_ptr = unsafe { page_ptr.add(item_offset) };
+                        
+                        let is_empty = unsafe { 
+                            let slice = std::slice::from_raw_parts(item_ptr, EntryHeader::SIZE); 
+                            slice.iter().all(|&b| b == 0)
+                        };
+
+                        if is_empty {
+                             self.free_list.push(abs_idx as usize);
+                        } else {
+                            // Valid Item
+                            if abs_idx >= self.idx {
+                                self.idx = abs_idx + 1;
+                            }
+                            
+                            // Parse Header
+                            let header_slice = unsafe { std::slice::from_raw_parts(item_ptr, EntryHeader::SIZE) };
+                            let _header = EntryHeader::from_bytes(header_slice);
+                            
+                            // TODO: Extract Key and Insert into Index
+                        }
+                    }
+                }
+                Err((_page_idx, _e)) => {
+                    panic!("Failed to rebuild");
+                }
+            }
+        }
     }
 
     pub fn preallocate(&mut self, offset: i64, size: i64) -> Result<(), Box<dyn Error>> {
@@ -112,25 +165,31 @@ impl < const N: i64> Slab< N> {
     }
     
     pub async fn write_item<'a>(&mut self, key: &'a[u8], value: &'a [u8]) -> Result<(), Box<dyn Error>>{
-        if self.free_list.len() != 0 {
-            panic!("no support for this at the moment");
-        }
-        if self.idx >= self.nb_max_items {
-            self.resize()?;
-        }
+        let item_idx = if let Some(idx) = self.free_list.pop() {
+            idx as i64
+        } else {
+            if self.idx >= self.nb_max_items {
+                self.resize()?;
+            }
+            let idx = self.idx;
+            self.idx += 1;
+            idx
+        };
 
-        let entry_offset = self.idx * N;
+        let entry_offset = item_idx * N;
         let page_number = entry_offset / PAGE_SIZE;
         let page_offset = entry_offset % PAGE_SIZE;
 
         let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let entry_header = EntryHeader{timestamp: time, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
 
-        let mut encoded = bitcode::encode(&entry_header);
-        encoded.reserve(key.len() + value.len());
-        encoded.extend_from_slice(key);
-        encoded.extend_from_slice(value);
+        let header_bytes = entry_header.to_bytes();
+        let total_size = EntryHeader::SIZE + key.len() + value.len();
         
+        let mut buffer = Vec::with_capacity(total_size);
+        buffer.extend_from_slice(&header_bytes);
+        buffer.extend_from_slice(key);
+        buffer.extend_from_slice(value);
 
         let maybe_page = self.page_manager.get_page(page_number);
         let mut page = match maybe_page {
@@ -140,10 +199,10 @@ impl < const N: i64> Slab< N> {
             }
         };
         
-        page.write_bytes(page_offset as u64, encoded.as_mut_ptr(), encoded.len());
+        page.write_bytes(page_offset as u64, buffer.as_mut_ptr(), buffer.len());
         let page_start_offset = page_number * PAGE_SIZE;
         page.write_to_file(&self.file, page_start_offset as u64).await?;
-        self.idx += 1;
+        
         Ok(())
     }
 
