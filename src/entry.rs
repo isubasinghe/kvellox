@@ -1,5 +1,6 @@
 // Constants representing the bit masks
 // Bit 0: 0000 0001
+#[allow(dead_code)]
 const DIRTY_MASK: u8 = 1 << 0; 
 // Bit 1: 0000 0010
 const TOMBSTONE_MASK: u8 = 1 << 1;
@@ -37,16 +38,19 @@ impl EntryHeader {
     // --- Dirty Bit Methods ---
 
     /// Sets the dirty bit to 1 (True)
+    #[allow(dead_code)]
     pub fn set_dirty(&mut self) {
         self.meta |= DIRTY_MASK;
     }
 
     /// Sets the dirty bit to 0 (False)
+    #[allow(dead_code)]
     pub fn clear_dirty(&mut self) {
         self.meta &= !DIRTY_MASK;
     }
 
     /// Returns true if the dirty bit is set
+    #[allow(dead_code)]
     pub fn is_dirty(&self) -> bool {
         (self.meta & DIRTY_MASK) != 0
     }
@@ -59,6 +63,7 @@ impl EntryHeader {
     }
 
     /// Sets the tombstone bit to 0 (False)
+    #[allow(dead_code)]
     pub fn clear_tombstone(&mut self) {
         self.meta &= !TOMBSTONE_MASK;
     }
@@ -70,6 +75,6 @@ impl EntryHeader {
 }
 
 pub struct EntryView<'a> {
-    header: &'a EntryHeader,
-    data: &'a [u8],
+    pub header: &'a EntryHeader,
+    pub data: &'a [u8],
 }

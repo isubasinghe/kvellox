@@ -1,6 +1,5 @@
 use crate::entry::EntryHeader;
 use super::static_data::*;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::Path;
 use std::fs::OpenOptions;
 use libc;
@@ -8,10 +7,29 @@ use super::page::{PageCacheManager, Page};
 use std::error::Error;
 use monoio::fs::File as MonoFile;
 use monoio::buf::IoBuf;
+use std::collections::{HashSet, HashMap};
+use futures::channel::oneshot;
+use std::rc::Rc;
+use std::cell::RefCell;
 
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+use std::os::unix::fs::OpenOptionsExt;
+
+pub enum SlabOp {
+    Write {
+        blob: Vec<u8>,
+        resp: oneshot::Sender<Result<(), String>>,
+        idx: usize,
+    },
+    Read {
+        idx: usize,
+        resp: oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+    Tombstone {
+        idx: usize,
+    }
+}
 
 pub struct Slab <const N: i64> {
     page_manager: PageCacheManager,
@@ -19,7 +37,8 @@ pub struct Slab <const N: i64> {
     free_list: Vec<usize>,
     idx: i64,
     nb_max_items: i64,
-    file: MonoFile,
+    file: Rc<MonoFile>,
+    pending_ops: Vec<SlabOp>,
 }
 
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -55,13 +74,14 @@ impl < const N: i64> Slab< N> {
             size_on_disk: meta.len() as i64, 
             free_list: Vec::new(), 
             idx: 0, 
-            file: mono_file, 
-            nb_max_items: (2*PAGE_SIZE)/N, 
+            file: Rc::new(mono_file), 
+            nb_max_items: (2*PAGE_SIZE)/N,
+            pending_ops: Vec::with_capacity(64),
         };
 
         slab.rebuild().await;
 
-        let target_size = std::cmp::max(slab.size_on_disk, 2 * PAGE_SIZE);
+        let target_size = std::cmp::max(slab.size_on_disk, 100 * 1024 * 1024); // 100MB initial
         if target_size > slab.size_on_disk {
              slab.preallocate(0, target_size).unwrap();
              slab.size_on_disk = target_size;
@@ -71,40 +91,34 @@ impl < const N: i64> Slab< N> {
         slab
     }
 
-    pub async fn rebuild(&mut self) {
-        let number_pages = self.size_on_disk / (PAGE_SIZE);
-        let items_per_page = PAGE_SIZE / N;
-        let max_items = number_pages * items_per_page;
-        self.nb_max_items = max_items;
+    pub async fn rebuild(&mut self) -> Vec<(Vec<u8>, usize)> {
+        let number_pages = self.size_on_disk / PAGE_SIZE;
         
         let mut futures = FuturesUnordered::new();
+        let mut results = Vec::new();
         
-        // Spawn reads
         for n in 0..number_pages {
             let offset = n * PAGE_SIZE;
-            let file_ref = &self.file; 
+            let file_ref = self.file.clone(); 
             futures.push(async move {
                 let mut page = Page::new();
-                if let Err(e) = page.read_from_file(file_ref, offset as u64).await {
+                if let Err(e) = page.read_from_file(&file_ref, offset as u64).await {
                     return Err((n, e));
                 }
                 Ok((n, page))
             });
         }
 
-        // Process pages as they load
         while let Some(result) = futures.next().await {
             match result {
                 Ok((page_idx, page)) => {
                     self.page_manager.page_hit(page_idx, page.clone());
                     
-                    // Iterate over items in the page
                     let items_per_page = PAGE_SIZE / N;
                     for i in 0..items_per_page {
                         let item_offset = (i * N) as usize;
                         let abs_idx = (page_idx * items_per_page) + i;
                         
-                        // Access raw bytes of the item
                         let page_ptr = page.read_ptr();
                         let item_ptr = unsafe { page_ptr.add(item_offset) };
                         
@@ -116,16 +130,21 @@ impl < const N: i64> Slab< N> {
                         if is_empty {
                              self.free_list.push(abs_idx as usize);
                         } else {
-                            // Valid Item
                             if abs_idx >= self.idx {
                                 self.idx = abs_idx + 1;
                             }
                             
-                            // Parse Header
                             let header_slice = unsafe { std::slice::from_raw_parts(item_ptr, EntryHeader::SIZE) };
-                            let _header = EntryHeader::from_bytes(header_slice);
+                            let header = EntryHeader::from_bytes(header_slice);
                             
-                            // TODO: Extract Key and Insert into Index
+                            if header.is_tombstone() {
+                                self.free_list.push(abs_idx as usize);
+                            } else {
+                                let key_size = header.key_size as usize;
+                                let key_ptr = unsafe { item_ptr.add(EntryHeader::SIZE) };
+                                let key_slice = unsafe { std::slice::from_raw_parts(key_ptr, key_size) };
+                                results.push((key_slice.to_vec(), abs_idx as usize));
+                            }
                         }
                     }
                 }
@@ -134,89 +153,221 @@ impl < const N: i64> Slab< N> {
                 }
             }
         }
+        results
     }
 
     pub fn preallocate(&mut self, offset: i64, size: i64) -> Result<(), Box<dyn Error>> {
         let fd = self.file.as_raw_fd(); 
-        let mode = 0;
-        let offset = offset;
-        let len = size;
         let ret = unsafe {
-            libc::fallocate(fd, mode, offset, len)
+            libc::fallocate(fd, 0, offset, size)
         };
 
         if ret == 0 {
             self.size_on_disk = size;
             self.nb_max_items = size / N;
             Ok(())
-        }else {
+        } else {
             Err(Box::new(std::io::Error::last_os_error()))
         }
     }
 
     pub fn resize(&mut self) -> Result<(), Box<dyn Error>> {
-        let new_size: i64;
-        if self.size_on_disk < 10000000000 { 
-            new_size = self.size_on_disk * 2;
-        }else {
-            new_size = self.size_on_disk + 10000000000;
-        }
+        let new_size = if self.size_on_disk < 10_000_000_000 { 
+            self.size_on_disk * 2
+        } else {
+            self.size_on_disk + 10_000_000_000
+        };
         self.preallocate(0, new_size)
     }
-    
-    pub async fn write_item<'a>(&mut self, key: &'a[u8], value: &'a [u8]) -> Result<(), Box<dyn Error>>{
-        let item_idx = if let Some(idx) = self.free_list.pop() {
-            idx as i64
+
+    pub fn queue_write(&mut self, blob: Vec<u8>, resp: oneshot::Sender<Result<(), String>>) -> usize {
+        if self.free_list.is_empty() && self.idx >= self.nb_max_items {
+            self.resize().unwrap();
+        }
+
+        let idx = if let Some(i) = self.free_list.pop() {
+            i 
         } else {
-            if self.idx >= self.nb_max_items {
-                self.resize()?;
-            }
-            let idx = self.idx;
+            let i = self.idx;
             self.idx += 1;
-            idx
+            i as usize
         };
 
-        let entry_offset = item_idx * N;
+        self.pending_ops.push(SlabOp::Write { blob, resp, idx });
+        idx
+    }
+
+    pub fn queue_read(&mut self, idx: usize, resp: oneshot::Sender<Result<Option<Vec<u8>>, String>>) {
+        self.pending_ops.push(SlabOp::Read { idx, resp });
+    }
+
+    pub fn queue_tombstone(&mut self, idx: usize) {
+        self.pending_ops.push(SlabOp::Tombstone { idx });
+    }
+
+    pub fn return_slot(&mut self, idx: usize) {
+        self.free_list.push(idx);
+    }
+
+    pub fn drain_ops(&mut self) -> Vec<SlabOp> {
+        std::mem::replace(&mut self.pending_ops, Vec::new())
+    }
+
+    pub fn has_pending_ops(&self) -> bool {
+        !self.pending_ops.is_empty()
+    }
+
+    pub fn pending_ops_count(&self) -> usize {
+        self.pending_ops.len()
+    }
+}
+
+pub async fn process_batch<const N: i64>(slab: Rc<RefCell<Slab<N>>>, ops: Vec<SlabOp>) {
+    if ops.is_empty() {
+        return;
+    }
+
+    let mut pages_needed = HashSet::new();
+    let mut op_locations = HashMap::new();
+
+    // Identify needed pages
+    for (i, op) in ops.iter().enumerate() {
+        let idx = match op {
+            SlabOp::Write { idx, .. } => *idx,
+            SlabOp::Read { idx, .. } => *idx,
+            SlabOp::Tombstone { idx } => *idx,
+        };
+        
+        let entry_offset = (idx as i64) * N;
         let page_number = entry_offset / PAGE_SIZE;
         let page_offset = entry_offset % PAGE_SIZE;
-
-        let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-        let entry_header = EntryHeader{timestamp: time, key_size: key.len() as i64, value_size: value.len() as i64, meta: 0};
-
-        let header_bytes = entry_header.to_bytes();
-        let total_size = EntryHeader::SIZE + key.len() + value.len();
         
-        let mut buffer = Vec::with_capacity(total_size);
-        buffer.extend_from_slice(&header_bytes);
-        buffer.extend_from_slice(key);
-        buffer.extend_from_slice(value);
+        pages_needed.insert(page_number);
+        op_locations.insert(i, (page_number, page_offset));
+    }
 
-        let maybe_page = self.page_manager.get_page(page_number);
-        let mut page = match maybe_page {
-            Some(page) => page,
-            None => {
-                self.read_page(page_number).await?
+    // Phase 1: Load missing pages
+    let mut missing_pages = Vec::new();
+    let file = {
+        let mut s = slab.borrow_mut();
+        // Check which pages are missing from cache
+        for &page_num in pages_needed.iter() {
+            if s.page_manager.get_page(page_num).is_none() {
+                missing_pages.push(page_num);
             }
-        };
-        
-        page.write_bytes(page_offset as u64, buffer.as_mut_ptr(), buffer.len());
-        let page_start_offset = page_number * PAGE_SIZE;
-        page.write_to_file(&self.file, page_start_offset as u64).await?;
-        
-        Ok(())
+        }
+        s.file.clone()
+    };
+
+    if !missing_pages.is_empty() {
+        let mut load_futures = FuturesUnordered::new();
+        for page_num in missing_pages {
+            let file_ref = file.clone();
+            load_futures.push(async move {
+                let mut page = Page::new();
+                let res = page.read_from_file(&file_ref, (page_num * PAGE_SIZE) as u64).await;
+                (page_num, page, res)
+            });
+        }
+
+        while let Some((p_num, page, res)) = load_futures.next().await {
+            if res.is_ok() {
+                slab.borrow_mut().page_manager.page_hit(p_num, page);
+            }
+        }
     }
 
-    pub async fn read_item(idx: usize) {
+    // Phase 2: Apply operations and identify dirty pages
+    let mut dirty_pages = HashSet::new();
+    let mut responses = Vec::new();
+
+    {
+        let mut s = slab.borrow_mut();
+        for (i, op) in ops.into_iter().enumerate() {
+            let (page_num, page_offset) = op_locations[&i];
+            match op {
+                SlabOp::Write { mut blob, resp, idx: _ } => {
+                    if let Some(mut page) = s.page_manager.get_page(page_num) {
+                        page.write_bytes(page_offset as u64, blob.as_mut_ptr(), blob.len());
+                        dirty_pages.insert(page_num);
+                        responses.push(Some((resp, Ok(()))));
+                    } else {
+                        let _ = resp.send(Err("Page load failed".to_string()));
+                        responses.push(None); 
+                    }
+                },
+                SlabOp::Read { idx: _, resp } => {
+                    if let Some(page) = s.page_manager.get_page(page_num) {
+                        let page_ptr = page.read_ptr();
+                        let item_ptr = unsafe { page_ptr.add(page_offset as usize) };
+                        let header_slice = unsafe { std::slice::from_raw_parts(item_ptr, EntryHeader::SIZE) };
+                        let header = EntryHeader::from_bytes(header_slice);
+                        
+                        if header.key_size == 0 && header.value_size == 0 {
+                            let _ = resp.send(Ok(None));
+                        } else {
+                            let val_offset = EntryHeader::SIZE + header.key_size as usize;
+                            let val_ptr = unsafe { item_ptr.add(val_offset) };
+                            let val_slice = unsafe { std::slice::from_raw_parts(val_ptr, header.value_size as usize) };
+                            let _ = resp.send(Ok(Some(val_slice.to_vec())));
+                        }
+                    } else {
+                        let _ = resp.send(Err("Page load failed".to_string()));
+                    }
+                    responses.push(None);
+                },
+                SlabOp::Tombstone { idx: _ } => {
+                    if let Some(mut page) = s.page_manager.get_page(page_num) {
+                        let page_ptr = page.read_ptr();
+                        let item_ptr = unsafe { page_ptr.add(page_offset as usize) };
+                        let header_slice = unsafe { std::slice::from_raw_parts(item_ptr, EntryHeader::SIZE) };
+                        let mut header = EntryHeader::from_bytes(header_slice);
+                        
+                        header.set_tombstone();
+                        let mut header_bytes = header.to_bytes();
+                        page.write_bytes(page_offset as u64, header_bytes.as_mut_ptr(), EntryHeader::SIZE);
+                        dirty_pages.insert(page_num);
+                    }
+                    responses.push(None);
+                }
+            }
+        }
     }
 
-    pub async fn read_page(&mut self, page_index: i64) -> Result<Page, Box<dyn Error>> {
-        let offset = page_index*PAGE_SIZE;
-        let mut page = Page::new();
-        page.read_from_file(&self.file, offset as u64).await?;
-        self.page_manager.page_hit(page_index, page.clone());
-        Ok(page)
+    // Phase 3: Write dirty pages
+    let file = slab.borrow().file.clone();
+    let mut write_futures = FuturesUnordered::new();
+    
+    // Create a snapshot of pages to write
+    let mut pages_to_write = Vec::new();
+    {
+        let mut s = slab.borrow_mut();
+        for page_num in dirty_pages {
+            if let Some(page) = s.page_manager.get_page(page_num) {
+                // We clone the page to keep it alive during write.
+                // Note: Page clone just increments pin count, it points to same memory.
+                pages_to_write.push((page_num, page.clone()));
+            }
+        }
     }
 
-    pub async fn write_page() {
+    for (page_num, page) in pages_to_write {
+        let file_ref = file.clone();
+        write_futures.push(async move {
+            page.write_to_file(&file_ref, (page_num * PAGE_SIZE) as u64).await
+        });
+    }
+
+    let mut flush_failed = false;
+    while let Some(res) = write_futures.next().await {
+        if res.is_err() { flush_failed = true; }
+    }
+
+    // Phase 4: Send responses
+    for r in responses {
+        if let Some((tx, res)) = r {
+            let final_res = if flush_failed { Err("Flush failed".to_string()) } else { res };
+            let _ = tx.send(final_res);
+        }
     }
 }

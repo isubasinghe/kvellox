@@ -36,11 +36,8 @@ impl PageDescriptor {
 impl Drop for PageDescriptor {
     fn drop(&mut self) {
         unsafe {
-            self.pin_count -= 1;
-            if self.pin_count == 0 {
-                let layout = Layout::from_size_align(4096, 4096).unwrap();
-                dealloc(self.buffer.as_ptr(), layout);
-            }
+            let layout = Layout::from_size_align(4096, 4096).unwrap();
+            dealloc(self.buffer.as_ptr(), layout);
         }
     }
 }
@@ -53,6 +50,18 @@ impl Clone for Page {
     fn clone(&self) -> Self {
        unsafe { (*self.data.as_ptr()).pin_count += 1; };
        Page{data: self.data}
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        unsafe {
+            let desc = self.data.as_mut();
+            desc.pin_count -= 1;
+            if desc.pin_count == 0 {
+                let _ = Box::from_raw(self.data.as_ptr());
+            }
+        }
     }
 }
 

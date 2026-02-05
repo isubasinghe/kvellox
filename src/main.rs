@@ -1,6 +1,8 @@
 use storage::Storage;
 use std::path::Path;
-use futures::future::join_all;
+use std::sync::Arc;
+use std::thread;
+use futures::stream::{FuturesUnordered, StreamExt};
 
 mod cli;
 mod page;
@@ -16,11 +18,6 @@ mod cache;
 mod fastcell;
 
 fn main() {
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_timer()
-        .build()
-        .unwrap();
-
     let db_path = Path::new("./db");
     
     // Ensure root exists
@@ -28,34 +25,53 @@ fn main() {
         std::fs::create_dir_all(db_path).unwrap();
     }
 
-    rt.block_on(async {
-        let mut storage = Storage::new(4, db_path).await.unwrap();
-        
-        println!("Starting writes (Sharded across 4 workers)...");
-        let start = std::time::Instant::now();
-        
-        let storage_ptr = &mut storage as *mut Storage;
-        
-        // Generate data and leak it to ensure 'static lifetime for the benchmark
-        let keys: Vec<String> = (0..100_000).map(|i| format!("key-{}", i)).collect();
-        let vals: Vec<String> = (0..100_000).map(|i| format!("val-{}", i)).collect();
-        let keys_ref: &'static Vec<String> = Box::leak(Box::new(keys));
-        let vals_ref: &'static Vec<String> = Box::leak(Box::new(vals));
-        
-        let mut futures = Vec::with_capacity(100_000);
-        
-        for i in 0..100_000 {
-            unsafe {
-                futures.push((*storage_ptr).write_item(keys_ref[i].as_bytes(), vals_ref[i].as_bytes()));
-            }
-        }
-        
-        // Execute batch
-        let _results = join_all(futures).await;
-        
-        let duration = start.elapsed();
-        println!("Writes completed! 100,000 items in {:?}", duration);
-        println!("Throughput: {:.2} items/sec", 100_000.0 / duration.as_secs_f64());
-    });
+    // Wrap storage in Arc for multithreaded access
+    let storage = Arc::new(Storage::new(4, db_path).unwrap());
+    
+    let num_client_threads = 4;
+    println!("Starting writes (Sharded across 4 workers, {} client threads)...", num_client_threads);
+    let start = std::time::Instant::now();
+    
+    let total_items = 1_000_000;
+    let items_per_thread = total_items / num_client_threads;
+    
+    let mut handles = Vec::new();
+    
+    for t in 0..num_client_threads {
+        let storage_ref = storage.clone();
+        handles.push(thread::spawn(move || {
+            let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                   .build().unwrap();
+            
+            rt.block_on(async {
+                let mut futures = FuturesUnordered::new();
+                for i in 0..items_per_thread {
+                    let unique_id = t * items_per_thread + i;
+                    let key = format!("key-{}", unique_id).into_bytes();
+                    let val = vec![0u8; 256]; // 256B value
+                    
+                    let s = storage_ref.clone();
+                    futures.push(async move {
+                        s.write_item(key, val).await
+                    });
+
+                    if futures.len() >= 1000 {
+                        futures.next().await;
+                    }
+                }
+                while let Some(_) = futures.next().await {}
+            });
+        }));
+    }
+    
+    for h in handles {
+        h.join().unwrap();
+    }
+    
+    let duration = start.elapsed();
+    let actual_total = items_per_thread * num_client_threads;
+    println!("Writes completed! {} items in {:?}", actual_total, duration);
+    println!("Throughput: {:.2} items/sec", actual_total as f64 / duration.as_secs_f64());
+    
     println!("Hello, world!");
 }
