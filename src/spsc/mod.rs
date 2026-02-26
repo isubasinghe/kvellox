@@ -167,3 +167,6 @@ impl SlabRingBuffer<ReaderQueue> {
         read 
     }
 }
+
+unsafe impl Send for SlabRingBuffer<WriteQueue> {}
+unsafe impl Send for SlabRingBuffer<ReaderQueue> {}
