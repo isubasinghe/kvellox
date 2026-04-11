@@ -115,55 +115,28 @@ where
 
     fn evict(&mut self) {
         let small_threshold = self.capacity / 10;
-        
+
         loop {
-            // If S is too big, or M is empty (force evict from S), we evict from S.
-            // Note: If both empty, loop terminates via returns (should not happen if len >= cap > 0)
             if self.small.len() > small_threshold || (self.main.is_empty() && !self.small.is_empty()) {
                 if self.small.is_empty() {
-                    return; // Should be impossible if logic holds
+                    return;
                 }
 
                 let key = self.small.pop_front().unwrap();
-                // Check if key is still in items (it must be)
                 let freq = self.items.get(&key).unwrap().freq;
 
                 if freq > 0 {
                     // Promote to Main
                     self.items.get_mut(&key).unwrap().freq = 0;
                     self.main.push_back(key);
-                    // Did not free space, continue loop
                 } else {
-                    // Evict
+                    // Evict from Small → Ghost
                     self.items.remove(&key);
                     self.insert_ghost(key);
-                    return; // Freed space
+                    return;
                 }
             } else {
-                // Evict from Main
                 if self.main.is_empty() {
-                    // If we reached here, Small <= threshold and Main is empty.
-                    // This implies total items <= threshold <= capacity/10.
-                    // So we shouldn't be evicting unless capacity is tiny.
-                    // If we ARE evicting, it means len >= capacity.
-                    // This implies capacity <= capacity/10 -> impossible unless capacity=0 (asserted >0).
-                    // Or if S has items but <= threshold, but we need space.
-                    // Wait. If S has 5 items, cap=100. thresh=10. Main empty.
-                    // We fall into this 'else' block.
-                    // But Main is empty.
-                    // So we MUST evict from S even if it's below threshold?
-                    // S3-FIFO: "If S > 0.1M".
-                    // But if cache is full, we must evict SOMETHING.
-                    // If M is empty, we must evict from S.
-                    // My condition `(self.main.is_empty() && !self.small.is_empty())` handles this.
-                    // So if we are here: Small <= threshold AND Main is NOT empty (or Small is empty).
-                    // If Small is empty, we must evict from Main.
-                    // If Main is empty, and Small empty -> empty cache.
-                    
-                    if self.small.is_empty() {
-                        return;
-                    }
-                    // If main is empty here, it's a logic bug in my condition analysis, but let's handle safety.
                     return;
                 }
 
@@ -171,13 +144,12 @@ where
                 let freq = self.items.get(&key).unwrap().freq;
 
                 if freq > 0 {
-                    // Decrement and reinsert
                     self.items.get_mut(&key).unwrap().freq -= 1;
                     self.main.push_back(key);
                 } else {
-                    // Evict from Main (does not go to Ghost)
+                    // Evict from Main (no Ghost)
                     self.items.remove(&key);
-                    return; // Freed space
+                    return;
                 }
             }
         }

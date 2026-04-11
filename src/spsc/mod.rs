@@ -33,6 +33,7 @@ pub struct SlabRingBuffer<T: QueueActor> {
     _mark: PhantomData<T>
 }
 
+#[derive(Debug)]
 pub enum SlabError {
    SlotSizeNotPowerOfTwo,
    CapacityNotPowerOfTwo,
@@ -107,6 +108,16 @@ impl SlabRingBuffer<InitQueue> {
     }
 }
 
+impl<T: QueueActor> SlabRingBuffer<T> {
+    pub fn base_ptr(&self) -> *mut u8 {
+        self.base.as_ptr()
+    }
+
+    pub fn total_size(&self) -> usize {
+        self.total_size
+    }
+}
+
 impl<T: QueueActor> Drop for SlabRingBuffer<T> {
     fn drop(&mut self) {
         let counts = unsafe { self.counts.as_ref() }.fetch_sub(1, AcqRel);
@@ -170,3 +181,140 @@ impl SlabRingBuffer<ReaderQueue> {
 
 unsafe impl Send for SlabRingBuffer<WriteQueue> {}
 unsafe impl Send for SlabRingBuffer<ReaderQueue> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    const PAGE_SIZE: usize = 4096;
+    const U32S_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<u32>();
+    const TOTAL_U32S: u32 = (U32S_PER_PAGE * 2) as u32;
+
+    fn produce_two_pages(mut writer: SlabRingBuffer<WriteQueue>) {
+        let mut counter: u32 = 0;
+        for page in 0..2 {
+            loop {
+                let ok = writer.try_write_item(|ptr| {
+                    let slot = ptr as *mut u32;
+                    for i in 0..U32S_PER_PAGE {
+                        unsafe { slot.add(i).write(counter) };
+                        counter += 1;
+                    }
+                    true
+                });
+                if ok {
+                    break;
+                }
+                std::hint::black_box(page);
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    fn consume_two_pages(mut reader: SlabRingBuffer<ReaderQueue>) -> u32 {
+        let mut expected: u32 = 0;
+        let mut pages_read: u32 = 0;
+
+        while pages_read < 2 {
+            let read = reader.try_read_item(|ptr| {
+                let slot = ptr as *const u32;
+                for i in 0..U32S_PER_PAGE {
+                    let val = unsafe { slot.add(i).read() };
+                    assert_eq!(val, expected, "at page {} offset {}", pages_read, i);
+                    expected += 1;
+                }
+                true
+            });
+            if read {
+                pages_read += 1;
+            } else {
+                std::hint::black_box(pages_read);
+                std::hint::spin_loop();
+            }
+        }
+        expected
+    }
+
+    #[test]
+    fn producer_spins_then_consumer_drains() {
+        let (mut writer, reader) = new_slab_ring_buffer(1, PAGE_SIZE).unwrap();
+
+        let producer_spinning = Arc::new(AtomicBool::new(false));
+        let spinning = producer_spinning.clone();
+
+        let producer = std::thread::spawn(move || {
+            // First write succeeds — buffer has one slot.
+            let ok = writer.try_write_item(|ptr| {
+                let slot = ptr as *mut u32;
+                for i in 0..U32S_PER_PAGE {
+                    unsafe { slot.add(i).write(i as u32) };
+                }
+                true
+            });
+            assert!(ok, "first write should succeed");
+
+            // Signal that we're about to spin on the second write.
+            spinning.store(true, Ordering::Release);
+
+            // Second write spins — buffer is full until consumer drains.
+            let mut counter: u32 = U32S_PER_PAGE as u32;
+            loop {
+                let ok = writer.try_write_item(|ptr| {
+                    let slot = ptr as *mut u32;
+                    for i in 0..U32S_PER_PAGE {
+                        unsafe { slot.add(i).write(counter) };
+                        counter += 1;
+                    }
+                    true
+                });
+                if ok {
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+        });
+
+        // Wait until the producer is actually spinning.
+        while !producer_spinning.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+
+        let consumer = std::thread::spawn(move || consume_two_pages(reader));
+
+        producer.join().expect("producer panicked");
+        let final_val = consumer.join().expect("consumer panicked");
+        assert_eq!(final_val, TOTAL_U32S);
+    }
+
+    #[test]
+    fn consumer_spins_then_producer_writes() {
+        let (writer, reader) = new_slab_ring_buffer(1, PAGE_SIZE).unwrap();
+
+        let consumer_ready = Arc::new(AtomicBool::new(false));
+        let ready = consumer_ready.clone();
+
+        let consumer = std::thread::spawn(move || {
+            // Spin 1000 times on an empty queue before signalling.
+            for i in 0..1000u32 {
+                std::hint::black_box(i);
+                std::hint::spin_loop();
+            }
+            ready.store(true, Ordering::Release);
+
+            consume_two_pages(reader)
+        });
+
+        // Wait until the consumer has finished its idle spin.
+        while !consumer_ready.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+
+        let producer = std::thread::spawn(move || produce_two_pages(writer));
+
+        producer.join().expect("producer panicked");
+        let final_val = consumer.join().expect("consumer panicked");
+        assert_eq!(final_val, TOTAL_U32S);
+    }
+}

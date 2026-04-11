@@ -6,3 +6,16 @@ edition = "2024"
 [dependencies]
 io-uring = "0.7.11"
 libc = "0.2"
+
+[dev-dependencies]
+core_affinity = "0.8.3"
+criterion = "0.8.2"
+ringbuf = "0.4.8"
+
+[[bench]]
+name = "spsc_throughput"
+harness = false
+
+[[bench]]
+name = "ringbuf_throughput"
+harness = false
