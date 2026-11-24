@@ -1,0 +1,11 @@
+name = "kvellModel"
+version = "0.1.0"
+defaultTargets = ["KvellModel"]
+
+[[require]]
+name = "veil"
+git = "https://github.com/verse-lab/veil.git"
+rev = "v4.35.0"
+
+[[lean_lib]]
+name = "KvellModel"
